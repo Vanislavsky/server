@@ -6560,6 +6560,7 @@ MY_UCA_INFO my_uca_v400=
       },
       1         /* levelno            */
     },
+    {0}
   },
 
   /* Logical positions */
@@ -30120,6 +30121,7 @@ MY_UCA_INFO my_uca_v520_th=
       },
       1              /* levelno */
     },
+    {0}
   },
 
   0x0009,    /* first_non_ignorable       p != ignore                       */
@@ -30170,6 +30172,8 @@ MY_UCA_INFO my_uca_v520=
       },
       1            /* levelno */
     },
+
+    {0}
   },
 
   0x0009,    /* first_non_ignorable       p != ignore                       */
@@ -30192,6 +30196,72 @@ MY_UCA_INFO my_uca_v520=
 
   /* Misc */
   520        /* Version */
+};
+
+
+#include "ctype-uca1400.h"
+
+static MY_UCA_INFO my_uca_v1400=
+{
+  {
+    {
+      0x10FFFF,      /* maxchar           */
+      (uchar *) uca1400_length,
+      (uint16 **) uca1400_weight,
+      {              /* Contractions:     */
+        array_elements(uca1400_contractions), /* nitems */
+        uca1400_contractions,                 /* item   */
+        NULL         /*   flags           */
+      },
+      0              /* levelno */
+    },
+
+    {
+      0x10FFFF,      /* maxchar */
+      (uchar *) uca1400_length_secondary,
+      (uint16 **) uca1400_weight_secondary,
+      {              /* Contractions: */
+        array_elements(uca1400_contractions_secondary), /* nitems */
+        uca1400_contractions_secondary,                 /* item   */
+        NULL         /*   flags */
+      },
+      1              /* levelno */
+    },
+
+    {
+      0x10FFFF,      /* maxchar */
+      (uchar *) uca1400_length_tertiary,
+      (uint16 **) uca1400_weight_tertiary,
+      {              /* Contractions: */
+        array_elements(uca1400_contractions_tertiary), /* nitems */
+        uca1400_contractions_tertiary,                 /* item   */
+        NULL         /*   flags */
+      },
+      2              /* levelno */
+    }
+
+  },
+
+  uca1400_non_ignorable_first,
+  uca1400_non_ignorable_last,
+
+  uca1400_primary_ignorable_first,
+  uca1400_primary_ignorable_last,
+
+  uca1400_secondary_ignorable_first,
+  uca1400_secondary_ignorable_last,
+
+  uca1400_tertiary_ignorable_first,
+  uca1400_tertiary_ignorable_last,
+
+  0x0000,    /* first_trailing */
+  0x0000,    /* last_trailing  */
+
+  uca1400_variable_first,
+  uca1400_variable_last,
+
+  /* Misc */
+  uca1400_version
 };
 
 
@@ -31154,6 +31224,45 @@ static const char myanmar[]= "[shift-after-method expand][version 5.2.0]"
 "&\\u1011\\u1019\\u1004\\u103A\\u1038=\\u1011\\u1039\\u1019\\u1004\\u103A\\u1038" /* cooked rice */
 "&\\u101C\\u1000\\u103A\\u1018\\u1000\\u103A=\\u101C\\u1039\\u1018\\u1000\\u103A" /* tea */
 ;
+
+
+typedef struct my_named_tailoring_st
+{
+  const char * tailoring;
+  const char * name;
+} MY_NAMED_TAILORING;
+
+
+#define DEFINE_TAILORING(x,y)  {(x), (y)}
+static MY_NAMED_TAILORING my_names_tailorings[MY_UCA_NAMED_TAILORINGS_COUNT]=
+{
+  DEFINE_TAILORING("",                ""),
+  DEFINE_TAILORING(german2,           "german2"),
+  DEFINE_TAILORING(icelandic,         "icelandic"),
+  DEFINE_TAILORING(latvian,           "latvian"),
+  DEFINE_TAILORING(romanian,          "romanian"),
+  DEFINE_TAILORING(slovenian,         "slovenian"),
+  DEFINE_TAILORING(polish,            "polish"),
+  DEFINE_TAILORING(estonian,          "estonian"),
+  DEFINE_TAILORING(spanish,           "spanish"),
+  DEFINE_TAILORING(swedish,           "swedish"),
+  DEFINE_TAILORING(turkish,           "turkish"),
+  DEFINE_TAILORING(czech,             "czech"),
+  DEFINE_TAILORING(danish,            "danish"),
+  DEFINE_TAILORING(lithuanian,        "lithuanian"),
+  DEFINE_TAILORING(slovak,            "slovak"),
+  DEFINE_TAILORING(spanish2,          "spanish2"),
+  DEFINE_TAILORING(roman,             "roman"),
+  DEFINE_TAILORING(persian,           "persian"),
+  DEFINE_TAILORING(esperanto,         "esperanto"),
+  DEFINE_TAILORING(hungarian,         "hungarian"),
+  DEFINE_TAILORING(croatian_mysql561, "croatian_mysql561"),
+  DEFINE_TAILORING(sinhala,           "sinhala"),
+  DEFINE_TAILORING(croatian_mariadb,  "croatian"),
+  DEFINE_TAILORING(vietnamese,        "vietnamese"),
+  DEFINE_TAILORING(myanmar,           "myanmar") /* TODO: "[version 5.2.0]" */
+};
+#undef DEFINE_TAILORING
 
 
 /*
@@ -32793,6 +32902,11 @@ my_coll_parser_scan_setting(MY_COLL_RULE_PARSER *p)
     rules->version= 520;
     rules->uca= &my_uca_v520;
   }
+  else if (!lex_cmp(lexem, C_STRING_WITH_LEN("[version 14.0.0]")))
+  {
+    rules->version= 1400;
+    rules->uca= &my_uca_v1400;
+  }
   else if (!lex_cmp(lexem, C_STRING_WITH_LEN("[shift-after-method expand]")))
   {
     rules->shift_after_method= my_shift_method_expand;
@@ -33430,7 +33544,7 @@ my_charset_loader_error_for_rule(MY_CHARSET_LOADER *loader,
 */
 static uint16 *
 my_uca_init_one_contraction(MY_CONTRACTIONS *contractions,
-                            my_wc_t *str, uint length, my_bool with_context)
+                            my_wc_t *str, size_t length, my_bool with_context)
 {
   int flag;
   uint i;
@@ -33505,7 +33619,7 @@ apply_one_rule(MY_CHARSET_LOADER *loader,
   {
     MY_CONTRACTIONS *contractions= &dst->contractions;
     to= my_uca_init_one_contraction(contractions,
-                                    r->curr, (uint)nshift, r->with_context);
+                                    r->curr, nshift, r->with_context);
     /* Store weights of the "reset to" character */
     dst->contractions.nitems--; /* Temporarily hide - it's incomplete */
     rc= my_char_weight_put(dst, rules->uca,
@@ -33737,7 +33851,7 @@ init_weight_level(MY_CHARSET_LOADER *loader, MY_COLL_RULES *rules,
   for (i= 0; i != src->contractions.nitems; i++)
   {
     MY_CONTRACTION *item= &src->contractions.item[i];
-    uint length= my_wstrnlen(item->ch, array_elements(item->ch));
+    size_t length= my_wstrnlen(item->ch, array_elements(item->ch));
     uint16 *weights= my_uca_init_one_contraction(&dst->contractions,
                                                  item->ch, length,
                                                  item->with_context);
@@ -33864,6 +33978,11 @@ create_tailoring(struct charset_info_st *cs,
     src_uca= &my_uca_v520;
     cs->caseinfo= &my_unicase_unicode520;
   }
+  else if (rules.version == 1400)     /* Unicode-14.0.0 */
+  {
+    src_uca= &my_uca_v1400;
+    cs->caseinfo= &my_unicase_unicode520;
+  }
   else if (rules.version == 400)      /* Unicode-4.0.0 requested */
   {
     src_uca= &my_uca_v400;
@@ -33875,7 +33994,10 @@ create_tailoring(struct charset_info_st *cs,
     if (!cs->caseinfo)
       cs->caseinfo= &my_unicase_default;
   }
-  cs->levels_for_order= rules.strength ? rules.strength : 1;
+  if (rules.strength)
+    cs->levels_for_order= rules.strength;
+  else if (!cs->levels_for_order)
+    cs->levels_for_order= 1;
 
   /*
     Copy logical positions, version, but don't copy levels -
@@ -38774,6 +38896,98 @@ struct charset_info_st my_charset_utf16_unicode_520_nopad_ci=
 
 #endif /* HAVE_CHARSET_utf16 */
 
+
+uint
+my_uca1400_make_builtin_collation_id(my_cs_encoding_t charset_id,
+                                     uint tailoring_id,
+                                     my_bool nopad,
+                                     my_bool secondary_level,
+                                     my_bool tertiary_level)
+{
+  /*
+    1000 0000 0000   0x800
+    1111 1111 1111   0xFFF
+    1ccc tttt tPST
+
+    c - charset ID (utf8mb3=0, utf8mb4=1, ucs2=2, utf16=3, utf32=4)
+    p - PAD/NO PAD
+    S - secondary level is enabled
+    T - tertiary level is enabled
+  */
+  return 2048 +
+         (charset_id << 8) +
+         (tailoring_id << 3) +
+         (nopad << 2) +
+         (secondary_level << 1) +
+         (tertiary_level << 0);
+}
+
+
+my_bool
+my_uca1400_collation_definition_init(MY_CHARSET_LOADER *loader,
+                                     struct charset_info_st *dst,
+                                     uint collation_id)
+{
+  my_cs_encoding_t charset_id= (my_cs_encoding_t) ((collation_id >> 8) & 0x07);
+  uint tailoring_id=       (collation_id >> 3) & 0x1F;
+  my_bool nopad=           (collation_id >> 2) & 0x01;
+  my_bool secondary_level= (collation_id >> 1) & 0x01;
+  my_bool tertiary_level=  (collation_id >> 0) & 0x01;
+  const MY_NAMED_TAILORING tailoring= my_names_tailorings[tailoring_id];
+  char tmp[128], *coll_name;
+  size_t length;
+
+  switch (charset_id) {
+  case MY_CS_ENCODING_UTF8MB3:
+    *dst= my_charset_utf8mb3_unicode_520_ci; /* TODO: check PAD */
+    break;
+  case MY_CS_ENCODING_UTF8MB4:
+    *dst= my_charset_utf8mb4_unicode_520_ci; /* TODO: check PAD */
+    break;
+  case MY_CS_ENCODING_UCS2:
+    *dst= my_charset_ucs2_unicode_520_ci; /* TODO: check PAD */
+    break;
+  case MY_CS_ENCODING_UTF16:
+    *dst= my_charset_utf16_unicode_520_ci; /* TODO: check PAD */
+    break;
+  case MY_CS_ENCODING_UTF32:
+    *dst= my_charset_utf32_unicode_520_ci; /* TODO: check PAD */
+    break;
+  }
+
+  dst->number= collation_id;
+  dst->uca= &my_uca_v1400;
+  dst->tailoring= tailoring.tailoring;
+  if (tailoring.tailoring == turkish)
+  {
+    dst->caseinfo= &my_unicase_turkish; /*TODO: unicase_1400_turkish */
+    dst->caseup_multiply= 2;
+    dst->casedn_multiply= 2;
+  }
+  else
+  {
+    dst->caseinfo= &my_unicase_unicode520;  /*TODO: unicase_1400*/
+    dst->caseup_multiply= 1;
+    dst->casedn_multiply= 1;
+  }
+  if (nopad)
+    dst->state|= MY_CS_NOPAD;
+  dst->levels_for_order= secondary_level ?
+                         tertiary_level  ? 3 : 2 : 1;
+  length= my_snprintf(tmp, sizeof(tmp), "%.*s_uca1400%s%s%s%s%s",
+                      (int) dst->cs_name.length, dst->cs_name.str,
+                      tailoring.name[0] ? "_" : "",
+                      tailoring.name,
+                      nopad ? "_nopad" : "",
+                      secondary_level ? "_as" : "_ai",
+                      tertiary_level ? "_cs" : "_ci");
+  if (!(coll_name= loader->once_alloc(length + 1)))
+    return TRUE;
+  strcpy(coll_name, tmp);
+  dst->coll_name.str= coll_name;
+  dst->coll_name.length= length;
+  return FALSE;
+}
 
 
 #endif /* HAVE_UCA_COLLATIONS */
