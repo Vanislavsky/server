@@ -1880,7 +1880,7 @@ int TABLE_SHARE::init_from_binary_frm_image(THD *thd, bool write,
   */
   if (legacy_db_type > DB_TYPE_UNKNOWN && 
       legacy_db_type < DB_TYPE_FIRST_DYNAMIC)
-    se_plugin= ha_lock_engine(NULL, ha_checktype(thd, legacy_db_type));
+    //se_plugin= ha_lock_engine(NULL, ha_checktype(thd, legacy_db_type));
   share->db_create_options= db_create_options= uint2korr(frm_image+30);
   share->db_options_in_use= share->db_create_options;
   share->mysql_version= uint4korr(frm_image+51);
@@ -2044,15 +2044,15 @@ int TABLE_SHARE::init_from_binary_frm_image(THD *thd, bool write,
       else if (!tmp_plugin)
       {
         /* purecov: begin inspected */
-        ((char*) name.str)[name.length]=0;
+        /*((char*) name.str)[name.length]=0;
         my_error(ER_UNKNOWN_STORAGE_ENGINE, MYF(0), name.str);
-        goto err;
+        goto err;*/
         /* purecov: end */
       }
       next_chunk+= str_db_type_length + 2;
     }
 
-    share->set_use_ext_keys_flag(plugin_hton(se_plugin)->flags & HTON_SUPPORTS_EXTENDED_KEYS);
+    //share->set_use_ext_keys_flag(plugin_hton(se_plugin)->flags & HTON_SUPPORTS_EXTENDED_KEYS);
 
     if (create_key_infos(disk_buff + 6, frm_image_end, keys, keyinfo,
                          new_frm_ver, &ext_key_parts,
@@ -2301,12 +2301,12 @@ int TABLE_SHARE::init_from_binary_frm_image(THD *thd, bool write,
     goto err;
 
  /* Allocate handler */
-  if (!(handler_file= get_new_handler(share, thd->mem_root,
-                                      plugin_hton(se_plugin))))
-    goto err;
+  //if (!(handler_file= get_new_handler(share, thd->mem_root,
+    //                                  plugin_hton(se_plugin))))
+   // goto err;
 
-  if (handler_file->set_ha_share_ref(&share->ha_share))
-    goto err;
+  /*if (handler_file->set_ha_share_ref(&share->ha_share))
+    goto err;*/
 
   record= share->default_values-1;              /* Fieldstart = 1 */
   null_bits_are_used= share->null_fields != 0;
@@ -3300,8 +3300,8 @@ int TABLE_SHARE::init_from_binary_frm_image(THD *thd, bool write,
     if (engine_table_options_frm_read(options.str, options.length, share))
       goto err;
   }
-  if (parse_engine_table_options(thd, handler_file->partition_ht(), share))
-    goto err;
+  /*if (parse_engine_table_options(thd, handler_file->partition_ht(), share))
+    goto err;*/
 
   if (share->found_next_number_field)
   {
@@ -4137,12 +4137,12 @@ enum open_frm_error open_table_from_share(THD *thd, TABLE_SHARE *share,
   outparam->file= 0;
   if (!(prgflag & OPEN_FRM_FILE_ONLY))
   {
-    if (!(outparam->file= get_new_handler(share, &outparam->mem_root,
+    /*if (!(outparam->file= get_new_handler(share, &outparam->mem_root,
                                           share->db_type())))
-      goto err;
+      goto err;*/
 
-    if (outparam->file->set_ha_share_ref(&share->ha_share))
-      goto err;
+   /* if (outparam->file->set_ha_share_ref(&share->ha_share))
+      goto err;*/
   }
   else
   {
