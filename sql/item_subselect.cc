@@ -2871,6 +2871,8 @@ bool Item_in_subselect::inject_in_to_exists_cond(JOIN *join_arg)
     }
 
     where_item= and_items(thd, join_arg->conds, where_item);
+
+    /* This is the fix_fields() call mentioned in the comment above */
     if (where_item->fix_fields_if_needed(thd, 0))
       DBUG_RETURN(true);
     // TIMOUR TODO: call optimize_cond() for the new where clause
@@ -2881,14 +2883,14 @@ bool Item_in_subselect::inject_in_to_exists_cond(JOIN *join_arg)
     /* Attach back the list of multiple equalities to the new top-level AND. */
     if (and_args && join_arg->cond_equal)
     {
-      /* The argument list of the top-level AND may change after fix fields. */
+      /*
+        The fix_fields() call above may have changed the argument list, so
+        fetch it again:
+      */
       and_args= ((Item_cond*) join_arg->conds)->argument_list();
-      List_iterator<Item_equal> li(join_arg->cond_equal->current_level);
-      Item_equal *elem;
-      while ((elem= li++))
-      {
-        and_args->push_back(elem, thd->mem_root);
-      }
+      ((Item_cond_and *) (join_arg->conds))->m_cond_equal=
+                                             *join_arg->cond_equal;
+      and_args->append((List<Item> *)&join_arg->cond_equal->current_level);
     }
   }
 

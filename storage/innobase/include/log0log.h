@@ -55,7 +55,7 @@ std::string get_log_file_path(const char *filename= LOG_FILE_NAME);
 static inline void delete_log_file(const char* suffix)
 {
   auto path = get_log_file_path(LOG_FILE_NAME_PREFIX).append(suffix);
-  os_file_delete_if_exists(innodb_log_file_key, path.c_str(), nullptr);
+  os_file_delete_if_exists_func(path.c_str(), nullptr);
 }
 
 struct completion_callback;
@@ -99,11 +99,6 @@ void
 log_print(
 /*======*/
 	FILE*	file);	/*!< in: file where to print */
-/**********************************************************************//**
-Refreshes the statistics used to print per-second averages. */
-void
-log_refresh_stats(void);
-/*===================*/
 
 /** Offsets of a log file header */
 /* @{ */
@@ -128,10 +123,10 @@ struct log_t;
 class log_file_t
 {
   friend log_t;
-  pfs_os_file_t m_file;
+  os_file_t m_file{OS_FILE_CLOSED};
 public:
   log_file_t()= default;
-  log_file_t(pfs_os_file_t file) noexcept : m_file(file) {}
+  log_file_t(os_file_t file) noexcept : m_file(file) {}
 
   /** Open a file
   @return file size in bytes
@@ -141,7 +136,7 @@ public:
 
   dberr_t close() noexcept;
   dberr_t read(os_offset_t offset, span<byte> buf) noexcept;
-  dberr_t write(os_offset_t offset, span<const byte> buf) noexcept;
+  void write(os_offset_t offset, span<const byte> buf) noexcept;
   bool flush() const noexcept { return os_file_flush(m_file); }
 #ifdef HAVE_PMEM
   byte *mmap(bool read_only, const struct stat &st) noexcept;
@@ -185,7 +180,7 @@ struct log_t
 
 private:
   /** The log sequence number of the last change of durable InnoDB files */
-  MY_ALIGNED(CPU_LEVEL1_DCACHE_LINESIZE)
+  alignas(CPU_LEVEL1_DCACHE_LINESIZE)
   std::atomic<lsn_t> lsn;
   /** the first guaranteed-durable log sequence number */
   std::atomic<lsn_t> flushed_to_disk_lsn;
@@ -194,9 +189,19 @@ private:
   This must hold if lsn - last_checkpoint_lsn > max_checkpoint_age. */
   std::atomic<bool> check_flush_or_checkpoint_;
 
+
+#if defined(__aarch64__)
+/* On ARM, we do more spinning */
+typedef srw_spin_lock log_rwlock_t;
+#define LSN_LOCK_ATTR MY_MUTEX_INIT_FAST
+#else
+typedef srw_lock log_rwlock_t;
+#define LSN_LOCK_ATTR nullptr
+#endif
+
 public:
   /** rw-lock protecting buf */
-  MY_ALIGNED(CPU_LEVEL1_DCACHE_LINESIZE) srw_lock latch;
+  alignas(CPU_LEVEL1_DCACHE_LINESIZE) log_rwlock_t latch;
 private:
   /** Last written LSN */
   lsn_t write_lsn;
@@ -214,7 +219,12 @@ public:
 
 private:
   /** spin lock protecting lsn, buf_free in append_prepare() */
-  MY_ALIGNED(CPU_LEVEL1_DCACHE_LINESIZE) srw_mutex lsn_lock;
+  alignas(CPU_LEVEL1_DCACHE_LINESIZE) pthread_mutex_t lsn_lock;
+  void init_lsn_lock() { pthread_mutex_init(&lsn_lock, LSN_LOCK_ATTR); }
+  void lock_lsn() { pthread_mutex_lock(&lsn_lock); }
+  void unlock_lsn() { pthread_mutex_unlock(&lsn_lock); }
+  void destroy_lsn_lock() { pthread_mutex_destroy(&lsn_lock); }
+
 public:
   /** first free offset within buf use; protected by lsn_lock */
   Atomic_relaxed<size_t> buf_free;
@@ -240,16 +250,6 @@ public:
   /** Log file */
   log_file_t log;
 
-	/** The fields involved in the log buffer flush @{ */
-
-	ulint		n_log_ios;	/*!< number of log i/os initiated thus
-					far */
-	ulint		n_log_ios_old;	/*!< number of log i/o's at the
-					previous printout */
-	time_t		last_printout_time;/*!< when log_print was last time
-					called */
-	/* @} */
-
 	/** Fields involved in checkpoints @{ */
 	lsn_t		log_capacity;	/*!< capacity of the log; if
 					the checkpoint age exceeds this, it is
@@ -268,12 +268,12 @@ public:
 					new query step is started */
   /** latest completed checkpoint (protected by latch.wr_lock()) */
   Atomic_relaxed<lsn_t> last_checkpoint_lsn;
-	lsn_t		next_checkpoint_lsn;
-					/*!< next checkpoint lsn */
+  /** next checkpoint LSN (protected by log_sys.mutex) */
+  lsn_t next_checkpoint_lsn;
   /** next checkpoint number (protected by latch.wr_lock()) */
   ulint next_checkpoint_no;
-  /** number of pending checkpoint writes */
-  ulint n_pending_checkpoint_writes;
+  /** whether a checkpoint is pending */
+  Atomic_relaxed<bool> checkpoint_pending;
 
   /** buffer for checkpoint header */
   byte *checkpoint_buf;
@@ -288,6 +288,10 @@ public:
 #endif
 
   bool is_opened() const noexcept { return log.is_opened(); }
+
+  /** Rename a log file after resizing.
+  @return whether an error occurred */
+  static bool rename_resized() noexcept;
 
   void attach(log_file_t file, os_offset_t size);
 
@@ -317,7 +321,9 @@ public:
 
   void set_recovered_lsn(lsn_t lsn) noexcept
   {
+#ifndef SUX_LOCK_GENERIC
     ut_ad(latch.is_write_locked());
+#endif /* SUX_LOCK_GENERIC */
     write_lsn= lsn;
     this->lsn.store(lsn, std::memory_order_relaxed);
     flushed_to_disk_lsn.store(lsn, std::memory_order_relaxed);
@@ -376,7 +382,9 @@ public:
   @param size  length of str, in bytes */
   void append(byte *&d, const void *s, size_t size) noexcept
   {
+#ifndef SUX_LOCK_GENERIC
     ut_ad(latch.is_locked());
+#endif
     ut_ad(d + size <= buf + (is_pmem() ? file_size : buf_size));
     memcpy(d, s, size);
     d+= size;

@@ -1,6 +1,6 @@
 /*
    Copyright (c) 2000, 2018, Oracle and/or its affiliates.
-   Copyright (c) 2010, 2021, MariaDB Corporation.
+   Copyright (c) 2010, 2022, MariaDB Corporation.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -722,7 +722,6 @@ bool Item_ident::remove_dependence_processor(void * arg)
   context= &((st_select_lex *) arg)->context;
   DBUG_RETURN(0);
 }
-
 
 bool Item_ident::collect_outer_ref_processor(void *param)
 {
@@ -2753,14 +2752,17 @@ Item_sp::Item_sp(THD *thd, Item_sp *item):
   memset(&sp_mem_root, 0, sizeof(sp_mem_root));
 }
 
-LEX_CSTRING Item_sp::func_name_cstring(THD *thd) const
+LEX_CSTRING
+Item_sp::func_name_cstring(THD *thd, bool is_package_function) const
 {
   /* Calculate length to avoid reallocation of string for sure */
   size_t len= (((m_name->m_explicit_name ? m_name->m_db.length : 0) +
               m_name->m_name.length)*2 + //characters*quoting
-             2 +                         // ` and `
+             2 +                         // quotes for the function name
+             2 +                         // quotes for the package name
              (m_name->m_explicit_name ?
               3 : 0) +                   // '`', '`' and '.' for the db
+             1 +                         // '.' between package and function
              1 +                         // end of string
              ALIGN_SIZE(1));             // to avoid String reallocation
   String qname((char *)alloc_root(thd->mem_root, len), len,
@@ -2772,7 +2774,21 @@ LEX_CSTRING Item_sp::func_name_cstring(THD *thd) const
     append_identifier(thd, &qname, &m_name->m_db);
     qname.append('.');
   }
-  append_identifier(thd, &qname, &m_name->m_name);
+  if (is_package_function)
+  {
+    /*
+      In case of a package function split `pkg.func` and print
+      quoted `pkg` and `func` separately, so the entire result looks like:
+         `db`.`pkg`.`func`
+    */
+    Database_qualified_name tmp= Database_qualified_name::split(m_name->m_name);
+    DBUG_ASSERT(tmp.m_db.length);
+    append_identifier(thd, &qname, &tmp.m_db);
+    qname.append('.');
+    append_identifier(thd, &qname, &tmp.m_name);
+  }
+  else
+    append_identifier(thd, &qname, &m_name->m_name);
   return { qname.c_ptr_safe(), qname.length() };
 }
 
@@ -6170,8 +6186,6 @@ bool Item_field::fix_fields(THD *thd, Item **reference)
   }
 #endif
   base_flags|= item_base_t::FIXED;
-  if (field->vcol_info)
-    fix_session_vcol_expr_for_read(thd, field, field->vcol_info);
   if (thd->variables.sql_mode & MODE_ONLY_FULL_GROUP_BY &&
       !outer_fixed && !thd->lex->in_sum_func &&
       select &&
@@ -9523,11 +9537,6 @@ bool Item_default_value::fix_fields(THD *thd, Item **items)
     uchar *newptr= (uchar*) thd->alloc(1+def_field->pack_length());
     if (!newptr)
       goto error;
-    /*
-      Even if DEFAULT() do not read tables fields, the default value
-      expression can do it.
-    */
-    fix_session_vcol_expr_for_read(thd, def_field, def_field->default_value);
     if (should_mark_column(thd->column_usage))
       def_field->default_value->expr->update_used_tables();
     def_field->move_field(newptr+1, def_field->maybe_null() ? newptr : 0, 1);

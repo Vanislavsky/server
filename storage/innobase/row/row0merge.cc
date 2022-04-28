@@ -909,11 +909,7 @@ row_merge_dup_report(
 	row_merge_dup_t*	dup,	/*!< in/out: for reporting duplicates */
 	const dfield_t*		entry)	/*!< in: duplicate index entry */
 {
-	if (!dup->n_dup++) {
-		if (!dup->table) {
-			/* bulk insert */
-			return;
-		}
+	if (!dup->n_dup++ && dup->table) {
 		/* Only report the first duplicate record,
 		but count all duplicate records. */
 		innobase_fields_to_mysql(dup->table, dup->index, entry);
@@ -2175,8 +2171,8 @@ scan_next:
 				/* Restore position on the record, or its
 				predecessor if the record was purged
 				meanwhile. */
-				btr_pcur_restore_position(
-					BTR_SEARCH_LEAF, &pcur, &mtr);
+				pcur.restore_position(
+					BTR_SEARCH_LEAF, &mtr);
 				/* Move to the successor of the
 				original record. */
 				if (!btr_pcur_move_to_next_user_rec(
@@ -2719,9 +2715,8 @@ write_buffers:
 						overflow). */
 						mtr.start();
 						mtr_started = true;
-						btr_pcur_restore_position(
-							BTR_SEARCH_LEAF, &pcur,
-							&mtr);
+						pcur.restore_position(
+							BTR_SEARCH_LEAF, &mtr);
 						buf = row_merge_buf_empty(buf);
 						merge_buf[i] = buf;
 						/* Restart the outer loop on the
@@ -3014,7 +3009,21 @@ wait_again:
 		err = fts_sync_table(const_cast<dict_table_t*>(new_table));
 
 		if (err == DB_SUCCESS) {
-			fts_update_next_doc_id(NULL, new_table, max_doc_id);
+			new_table->fts->cache->synced_doc_id = max_doc_id;
+
+		        /* Update the max value as next FTS_DOC_ID */
+			if (max_doc_id >= new_table->fts->cache->next_doc_id) {
+				new_table->fts->cache->next_doc_id =
+					max_doc_id + 1;
+			}
+
+			new_table->fts->cache->first_doc_id =
+				new_table->fts->cache->next_doc_id;
+
+			err= fts_update_sync_doc_id(
+				new_table,
+				new_table->fts->cache->synced_doc_id,
+				NULL);
 		}
 	}
 
@@ -3823,11 +3832,7 @@ row_merge_insert_index_tuples(
 
 			Any modifications after the
 			row_merge_read_clustered_index() scan
-			will go through row_log_table_apply().
-			Any modifications to off-page columns
-			will be tracked by
-			row_log_table_blob_alloc() and
-			row_log_table_blob_free(). */
+			will go through row_log_table_apply(). */
 			row_merge_copy_blobs(
 				mrec, offsets,
 				old_table->space->zip_size(),
@@ -4336,7 +4341,6 @@ pfs_os_file_t
 row_merge_file_create_low(
 	const char*	path)
 {
-	innodb_wait_allow_writes();
 	if (!path) {
 		path = mysql_tmpdir;
 	}
@@ -5010,6 +5014,13 @@ func_exit:
 					MONITOR_BACKGROUND_DROP_INDEX);
 			}
 		}
+
+		dict_index_t *clust_index= new_table->indexes.start;
+		clust_index->lock.x_lock(SRW_LOCK_CALL);
+		ut_ad(!clust_index->online_log ||
+		      clust_index->online_log_is_dummy());
+		clust_index->online_log= nullptr;
+		clust_index->lock.x_unlock();
 	}
 
 	DBUG_RETURN(error);
@@ -5192,7 +5203,11 @@ add_to_buf:
       row_merge_dup_t dup{index, nullptr, nullptr, 0};
       row_merge_buf_sort(buf, &dup);
       if (dup.n_dup)
-        return DB_DUPLICATE_KEY;
+      {
+        trx->error_info= index;
+        err= DB_DUPLICATE_KEY;
+        goto func_exit;
+      }
     }
     else
       row_merge_buf_sort(buf, NULL);
@@ -5201,7 +5216,10 @@ add_to_buf:
     file->n_rec+= buf->n_tuples;
     err= write_to_tmp_file(i);
     if (err != DB_SUCCESS)
-      return err;
+    {
+      trx->error_info= index;
+      goto func_exit;
+    }
     clean_bulk_buffer(i);
     buf= &m_merge_buf[i];
     goto add_to_buf;
@@ -5230,7 +5248,10 @@ dberr_t row_merge_bulk_t::write_to_index(ulint index_no, trx_t *trx)
     {
       row_merge_buf_sort(&buf, &dup);
       if (dup.n_dup)
-        return DB_DUPLICATE_KEY;
+      {
+        err= DB_DUPLICATE_KEY;
+        goto func_exit;
+      }
     }
     else row_merge_buf_sort(&buf, NULL);
     if (file && file->fd != OS_FILE_CLOSED)
@@ -5263,6 +5284,8 @@ dberr_t row_merge_bulk_t::write_to_index(ulint index_no, trx_t *trx)
         nullptr, &m_blob_file);
 
 func_exit:
+  if (err != DB_SUCCESS)
+    trx->error_info= index;
   err= btr_bulk.finish(err);
   return err;
 }

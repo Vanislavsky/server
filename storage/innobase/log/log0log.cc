@@ -61,9 +61,9 @@ Every change to a contents of a data page must be done
 through mtr_t, and mtr_t::commit() will write log records
 to the InnoDB redo log. */
 
-MY_ALIGNED(CPU_LEVEL1_DCACHE_LINESIZE)
+alignas(CPU_LEVEL1_DCACHE_LINESIZE)
 static group_commit_lock flush_lock;
-MY_ALIGNED(CPU_LEVEL1_DCACHE_LINESIZE)
+alignas(CPU_LEVEL1_DCACHE_LINESIZE)
 static group_commit_lock write_lock;
 
 /** Redo log system */
@@ -76,8 +76,9 @@ log_t	log_sys;
 
 void log_t::set_capacity()
 {
+#ifndef SUX_LOCK_GENERIC
 	ut_ad(log_sys.latch.is_write_locked());
-
+#endif
 	/* Margin for the free space in the smallest log, before a new query
 	step which modifies the database, is started */
 
@@ -101,7 +102,7 @@ void log_t::create()
   ut_ad(!is_initialised());
 
   latch.SRW_LOCK_INIT(log_latch_key);
-  lsn_lock.init();
+  init_lsn_lock();
 
   /* LSN 0 and 1 are reserved; @see buf_page_t::oldest_modification_ */
   lsn.store(FIRST_LSN, std::memory_order_relaxed);
@@ -125,17 +126,12 @@ void log_t::create()
   max_buf_free= buf_size / LOG_BUF_FLUSH_RATIO - LOG_BUF_FLUSH_MARGIN;
   set_check_flush_or_checkpoint();
 
-  n_log_ios_old= n_log_ios;
-  last_printout_time= time(NULL);
-
   last_checkpoint_lsn= FIRST_LSN;
-  n_log_ios= 0;
-  n_log_ios_old= 0;
   log_capacity= 0;
   max_modified_age_async= 0;
   max_checkpoint_age= 0;
   next_checkpoint_lsn= 0;
-  n_pending_checkpoint_writes= 0;
+  checkpoint_pending= false;
 
   buf_free= 0;
 
@@ -146,7 +142,7 @@ dberr_t log_file_t::close() noexcept
 {
   ut_a(is_opened());
 
-  if (!os_file_close(m_file))
+  if (!os_file_close_func(m_file))
     return DB_ERROR;
 
   m_file= OS_FILE_CLOSED;
@@ -159,11 +155,12 @@ dberr_t log_file_t::read(os_offset_t offset, span<byte> buf) noexcept
   return os_file_read(IORequestRead, m_file, buf.data(), offset, buf.size());
 }
 
-dberr_t log_file_t::write(os_offset_t offset, span<const byte> buf) noexcept
+void log_file_t::write(os_offset_t offset, span<const byte> buf) noexcept
 {
   ut_ad(is_opened());
-  return os_file_write(IORequestWrite, "ib_logfile0", m_file,
-                       buf.data(), offset, buf.size());
+  if (dberr_t err= os_file_write(IORequestWrite, "ib_logfile0", m_file,
+                                 buf.data(), offset, buf.size()))
+    ib::fatal() << "write(\"ib_logfile0\") returned " << err;
 }
 
 #ifdef HAVE_PMEM
@@ -191,11 +188,16 @@ void log_t::attach(log_file_t file, os_offset_t size)
       struct stat st;
       if (!fstat(log.m_file, &st))
       {
+        MSAN_STAT_WORKAROUND(&st);
         const auto st_dev= st.st_dev;
-        if (!stat("/dev/shm", &st) && st.st_dev == st_dev)
-          ptr= my_mmap(0, size_t(size),
-                       srv_read_only_mode ? PROT_READ : PROT_READ | PROT_WRITE,
-                       MAP_SHARED, log.m_file, 0);
+        if (!stat("/dev/shm", &st))
+        {
+          MSAN_STAT_WORKAROUND(&st);
+          if (st.st_dev == st_dev)
+            ptr= my_mmap(0, size_t(size), srv_read_only_mode
+                         ? PROT_READ : PROT_READ | PROT_WRITE,
+                         MAP_SHARED, log.m_file, 0);
+        }
       }
     }
 #endif /* __linux__ */
@@ -221,7 +223,9 @@ void log_t::attach(log_file_t file, os_offset_t size)
   if (!block_size)
     set_block_size(512);
 # ifdef __linux__
-  else if (srv_file_flush_method != SRV_O_DSYNC)
+  else if (srv_file_flush_method != SRV_O_DSYNC &&
+           srv_file_flush_method != SRV_O_DIRECT &&
+           srv_file_flush_method != SRV_O_DIRECT_NO_FSYNC)
     sql_print_information("InnoDB: Buffered log writes (block size=%u bytes)",
                           block_size);
 #endif
@@ -238,7 +242,9 @@ void log_t::attach(log_file_t file, os_offset_t size)
 
 void log_t::create(lsn_t lsn) noexcept
 {
+#ifndef SUX_LOCK_GENERIC
   ut_ad(latch.is_write_locked());
+#endif
   ut_ad(!recv_no_log_write);
   ut_ad(is_latest());
   ut_ad(this == &log_sys);
@@ -518,11 +524,14 @@ inline void log_t::persist(lsn_t lsn) noexcept
 
 /** Write buf to ib_logfile0.
 @tparam release_latch whether to invoke latch.wr_unlock()
-@return new write target
-@retval 0 if everything was written */
+@return lsn of a callback pending on write_lock
+@retval 0 if everything was written
+*/
 template<bool release_latch> inline lsn_t log_t::write_buf() noexcept
 {
+#ifndef SUX_LOCK_GENERIC
   ut_ad(latch.is_write_locked());
+#endif
   ut_ad(!srv_read_only_mode);
   ut_ad(!is_pmem());
 
@@ -540,7 +549,7 @@ template<bool release_latch> inline lsn_t log_t::write_buf() noexcept
     write_lock.set_pending(lsn);
     ut_ad(write_lsn >= get_flushed_lsn());
     const size_t block_size_1{get_block_size() - 1};
-    const lsn_t offset{calc_lsn_offset(write_lsn) & ~block_size_1};
+    const lsn_t offset{calc_lsn_offset(write_lsn) & ~lsn_t{block_size_1}};
 
     DBUG_PRINT("ib_log", ("write " LSN_PF " to " LSN_PF " at " LSN_PF,
                           write_lsn, lsn, offset));
@@ -605,7 +614,9 @@ inline bool log_t::flush(lsn_t lsn) noexcept
 /** Ensure that previous log writes are durable.
 @param lsn  previously written LSN
 @return new durable lsn target
-@retval 0   if everything was adequately written */
+@retval 0  if there are no pending callbacks on flush_lock
+           or there is another group commit lead.
+*/
 static lsn_t log_flush(lsn_t lsn)
 {
   ut_ad(!log_sys.is_pmem());
@@ -649,32 +660,34 @@ void log_write_up_to(lsn_t lsn, bool durable,
 #endif
 
 repeat:
-  if (durable &&
-      flush_lock.acquire(lsn, callback) != group_commit_lock::ACQUIRED)
-    return;
+  if (durable)
+  {
+    if (flush_lock.acquire(lsn, callback) != group_commit_lock::ACQUIRED)
+      return;
+    flush_lock.set_pending(log_sys.get_lsn());
+  }
+ 
 
-  lsn_t write_lsn;
+  lsn_t pending_write_lsn= 0, pending_flush_lsn= 0;
 
   if (write_lock.acquire(lsn, durable ? nullptr : callback) ==
       group_commit_lock::ACQUIRED)
   {
     log_sys.latch.wr_lock(SRW_LOCK_CALL);
-    write_lsn= log_sys.write_buf<true>();
+    pending_write_lsn= log_sys.write_buf<true>();
   }
-  else
-    write_lsn= 0;
 
   if (durable)
   {
-    lsn= log_flush(write_lock.value());
-    if (lsn || write_lsn)
-    {
-      /* There is no new group commit lead; some async waiters could stall. */
-      callback= &dummy_callback;
-      if (write_lsn > lsn)
-        lsn= write_lsn;
-      goto repeat;
-    }
+    pending_flush_lsn= log_flush(write_lock.value());
+  }
+
+  if (pending_write_lsn || pending_flush_lsn)
+  {
+    /* There is no new group commit lead; some async waiters could stall. */
+    callback= &dummy_callback;
+    lsn= std::max(pending_write_lsn, pending_flush_lsn);
+    goto repeat;
   }
 }
 
@@ -901,22 +914,6 @@ wait_suspend_loop:
 		buf_flush_buffer_pool();
 	}
 
-	if (log_sys.is_initialised()) {
-		log_sys.latch.rd_lock(SRW_LOCK_CALL);
-		const ulint	n_write	= log_sys.n_pending_checkpoint_writes;
-		log_sys.latch.rd_unlock();
-
-		if (n_write) {
-			if (srv_print_verbose_log && count > 600) {
-				sql_print_information(
-					"InnoDB: Pending checkpoint writes: "
-					ULINTPF, n_write);
-				count = 0;
-			}
-			goto loop;
-		}
-	}
-
 	if (srv_fast_shutdown == 2 || !srv_was_started) {
 		if (!srv_read_only_mode && srv_was_started) {
 			ib::info() << "Executing innodb_fast_shutdown=2."
@@ -996,9 +993,6 @@ log_print(
 /*======*/
 	FILE*	file)	/*!< in: file where to print */
 {
-	double	time_elapsed;
-	time_t	current_time;
-
 	log_sys.latch.rd_lock(SRW_LOCK_CALL);
 
 	const lsn_t lsn= log_sys.get_lsn();
@@ -1016,38 +1010,7 @@ log_print(
 		pages_flushed,
 		lsn_t{log_sys.last_checkpoint_lsn});
 
-	current_time = time(NULL);
-
-	time_elapsed = difftime(current_time,
-				log_sys.last_printout_time);
-
-	if (time_elapsed <= 0) {
-		time_elapsed = 1;
-	}
-
-	fprintf(file,
-		ULINTPF " pending chkp writes\n"
-		ULINTPF " log i/o's done, %.2f log i/o's/second\n",
-		log_sys.n_pending_checkpoint_writes,
-		log_sys.n_log_ios,
-		static_cast<double>(
-			log_sys.n_log_ios - log_sys.n_log_ios_old)
-		/ time_elapsed);
-
-	log_sys.n_log_ios_old = log_sys.n_log_ios;
-	log_sys.last_printout_time = current_time;
-
 	log_sys.latch.rd_unlock();
-}
-
-/**********************************************************************//**
-Refreshes the statistics used to print per-second averages. */
-void
-log_refresh_stats(void)
-/*===================*/
-{
-	log_sys.n_log_ios_old = log_sys.n_log_ios;
-	log_sys.last_printout_time = time(NULL);
 }
 
 /** Shut down the redo log subsystem. */
@@ -1071,7 +1034,7 @@ void log_t::close()
 #endif
 
   latch.destroy();
-  lsn_lock.destroy();
+  destroy_lsn_lock();
 
   recv_sys.close();
 

@@ -1,5 +1,5 @@
 /* Copyright (c) 2000, 2019, Oracle and/or its affiliates.
-   Copyright (c) 2009, 2021, MariaDB Corporation.
+   Copyright (c) 2009, 2022, MariaDB Corporation.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -615,6 +615,13 @@ Query_tables_list::binlog_stmt_unsafe_errcode[BINLOG_STMT_UNSAFE_COUNT] =
   ER_BINLOG_UNSAFE_UPDATE_IGNORE,
   ER_BINLOG_UNSAFE_INSERT_TWO_KEYS,
   ER_BINLOG_UNSAFE_AUTOINC_NOT_FIRST,
+  /*
+    There is no need to add new error code as we plan to get rid of auto
+    increment lock mode variable, so we use existing error code below, add
+    the correspondent text to the existing error message during merging to
+    non-GA release.
+  */
+  ER_BINLOG_UNSAFE_SYSTEM_VARIABLE,
   ER_BINLOG_UNSAFE_SKIP_LOCKED
 };
 
@@ -4965,7 +4972,21 @@ bool st_select_lex::optimize_unflattened_subqueries(bool const_only)
       }
       if (empty_union_result)
         subquery_predicate->no_rows_in_result();
-      if (!is_correlated_unit)
+
+      if (is_correlated_unit)
+      {
+        /*
+          Some parts of UNION are not correlated. This means we will need to
+          re-execute the whole UNION every time. Mark all parts of the UNION
+          as correlated so that they are prepared to be executed multiple
+          times (if we don't do that, some part of the UNION may free its
+          execution data at the end of first execution and crash on the second
+          execution)
+        */
+        for (SELECT_LEX *sl= un->first_select(); sl; sl= sl->next_select())
+          sl->uncacheable |= UNCACHEABLE_DEPENDENT;
+      }
+      else
         un->uncacheable&= ~UNCACHEABLE_DEPENDENT;
       subquery_predicate->is_correlated= is_correlated_unit;
     }
@@ -9248,6 +9269,43 @@ bool LEX::call_statement_start(THD *thd, const Lex_ident_sys_st *name1,
 }
 
 
+bool LEX::call_statement_start(THD *thd,
+                               const Lex_ident_sys_st *db,
+                               const Lex_ident_sys_st *pkg,
+                               const Lex_ident_sys_st *proc)
+{
+  Database_qualified_name q_db_pkg(db, pkg);
+  Database_qualified_name q_pkg_proc(pkg, proc);
+  sp_name *spname;
+
+  sql_command= SQLCOM_CALL;
+
+  if (check_db_name(reinterpret_cast<LEX_STRING*>
+                    (const_cast<LEX_CSTRING*>
+                     (static_cast<const LEX_CSTRING*>(db)))))
+  {
+    my_error(ER_WRONG_DB_NAME, MYF(0), db->str);
+    return true;
+  }
+  if (check_routine_name(pkg) ||
+      check_routine_name(proc))
+    return true;
+
+  // Concat `pkg` and `name` to `pkg.name`
+  LEX_CSTRING pkg_dot_proc;
+  if (q_pkg_proc.make_qname(thd->mem_root, &pkg_dot_proc) ||
+      check_ident_length(&pkg_dot_proc) ||
+      !(spname= new (thd->mem_root) sp_name(db, &pkg_dot_proc, true)))
+    return true;
+
+  sp_handler_package_function.add_used_routine(thd->lex, thd, spname);
+  sp_handler_package_body.add_used_routine(thd->lex, thd, &q_db_pkg);
+
+  return !(m_sql_cmd= new (thd->mem_root) Sql_cmd_call(spname,
+                                              &sp_handler_package_procedure));
+}
+
+
 sp_package *LEX::get_sp_package() const
 {
   return sphead ? sphead->get_package() : NULL;
@@ -9519,6 +9577,56 @@ Item *LEX::make_item_func_call_generic(THD *thd, Lex_ident_cli_st *cdb,
   Create_qfunc *builder= find_qualified_function_builder(thd);
   DBUG_ASSERT(builder);
   return builder->create_with_db(thd, &db, &name, true, args);
+}
+
+
+/*
+  Create a 3-step qualified function call.
+  Currently it's possible for package routines only, e.g.:
+     SELECT db.pkg.func();
+*/
+Item *LEX::make_item_func_call_generic(THD *thd,
+                                       Lex_ident_cli_st *cdb,
+                                       Lex_ident_cli_st *cpkg,
+                                       Lex_ident_cli_st *cfunc,
+                                       List<Item> *args)
+{
+  static Lex_cstring dot(".", 1);
+  Lex_ident_sys db(thd, cdb), pkg(thd, cpkg), func(thd, cfunc);
+  Database_qualified_name q_db_pkg(db, pkg);
+  Database_qualified_name q_pkg_func(pkg, func);
+  sp_name *qname;
+
+  if (db.is_null() || pkg.is_null() || func.is_null())
+    return NULL; // EOM
+
+  if (check_db_name((LEX_STRING*) static_cast<LEX_CSTRING*>(&db)))
+  {
+    my_error(ER_WRONG_DB_NAME, MYF(0), db.str);
+    return NULL;
+  }
+  if (check_routine_name(&pkg) ||
+      check_routine_name(&func))
+    return NULL;
+
+  // Concat `pkg` and `name` to `pkg.name`
+  LEX_CSTRING pkg_dot_func;
+  if (q_pkg_func.make_qname(thd->mem_root, &pkg_dot_func) ||
+      check_ident_length(&pkg_dot_func) ||
+      !(qname= new (thd->mem_root) sp_name(&db, &pkg_dot_func, true)))
+    return NULL;
+
+  sp_handler_package_function.add_used_routine(thd->lex, thd, qname);
+  sp_handler_package_body.add_used_routine(thd->lex, thd, &q_db_pkg);
+
+  thd->lex->safe_to_cache_query= 0;
+
+  if (args && args->elements > 0)
+    return new (thd->mem_root) Item_func_sp(thd, thd->lex->current_context(),
+                                            qname, &sp_handler_package_function,
+                                            *args);
+  return new (thd->mem_root) Item_func_sp(thd, thd->lex->current_context(),
+                                          qname, &sp_handler_package_function);
 }
 
 

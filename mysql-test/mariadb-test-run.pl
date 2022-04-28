@@ -1783,7 +1783,7 @@ sub collect_mysqld_features_from_running_server ()
   }
 
   mtr_add_arg($args, "--silent"); # Tab separated output
-  mtr_add_arg($args, "-e '%s'", "use mysql; SHOW VARIABLES");
+  mtr_add_arg($args, "-e \"use mysql; SHOW VARIABLES\"");
   my $cmd= "$mysql " . join(' ', @$args);
   mtr_verbose("cmd: $cmd");
 
@@ -5695,7 +5695,7 @@ sub usage ($) {
   {
     print STDERR "$message\n";
     print STDERR "For full list of options, use $0 --help\n";
-    exit;      
+    exit(1);
   }
 
   local $"= ','; # for @DEFAULT_SUITES below

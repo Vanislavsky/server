@@ -60,7 +60,7 @@ endif
 
 # Only attempt to build with PMEM on archs that have package libpmem-dev available
 # See https://packages.debian.org/search?searchon=names&keywords=libpmem-dev
-ifneq (,$(filter $(DEB_HOST_ARCH_CPU),amd64 arm64 ppc64el))
+ifneq (,$(filter $(DEB_HOST_ARCH_CPU),amd64 arm64 ppc64el riscv64))
 		CMAKEFLAGS += -DWITH_PMEM=yes
 endif
 
@@ -112,7 +112,7 @@ override_dh_auto_build:
 	@echo "RULES.$@"
 	# Print build env info to help debug builds on different platforms
 	dpkg-architecture
-	cd $(BUILDDIR) && $(MAKE)
+	cd $(BUILDDIR) && $(MAKE) --output-sync=target
 
 override_dh_auto_test:
 	@echo "RULES.$@"

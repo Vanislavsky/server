@@ -51,7 +51,6 @@ Created 10/21/1995 Heikki Tuuri
 #ifdef HAVE_LINUX_UNISTD_H
 #include "unistd.h"
 #endif
-#include "os0thread.h"
 #include "buf0dblwr.h"
 
 #include <tpool_structs.h>
@@ -146,9 +145,6 @@ static ulint	os_innodb_umask = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP;
 static ulint	os_innodb_umask	= 0;
 #endif /* _WIN32 */
 
-
-#define WAIT_ALLOW_WRITES() innodb_wait_allow_writes()
-
 Atomic_counter<ulint> os_n_file_reads;
 static ulint	os_bytes_read_since_printout;
 Atomic_counter<size_t> os_n_file_writes;
@@ -166,7 +162,6 @@ extern uint page_zip_level;
 #ifdef UNIV_PFS_IO
 /* Keys to register InnoDB I/O with performance schema */
 mysql_pfs_key_t  innodb_data_file_key;
-mysql_pfs_key_t  innodb_log_file_key;
 mysql_pfs_key_t  innodb_temp_file_key;
 #endif
 
@@ -370,7 +365,6 @@ FILE*
 os_file_create_tmpfile()
 {
 	FILE*	file	= NULL;
-	WAIT_ALLOW_WRITES();
 	File	fd	= mysql_tmpfile("ib");
 
 	if (fd >= 0) {
@@ -933,7 +927,7 @@ os_file_status_posix(
 
 	if (!ret) {
 		/* file exists, everything OK */
-
+		MSAN_STAT_WORKAROUND(&statinfo);
 	} else if (errno == ENOENT || errno == ENOTDIR || errno == ENAMETOOLONG) {
 		/* file does not exist */
 		return(true);
@@ -970,7 +964,6 @@ os_file_flush_func(
 {
 	int	ret;
 
-	WAIT_ALLOW_WRITES();
 	ret = os_file_sync_posix(file);
 
 	if (ret == 0) {
@@ -1021,10 +1014,6 @@ os_file_create_simple_func(
 
 	int		create_flag;
 	const char*	mode_str	= NULL;
-
-	if (create_mode != OS_FILE_OPEN && create_mode != OS_FILE_OPEN_RAW) {
-		WAIT_ALLOW_WRITES();
-	}
 
 	ut_a(!(create_mode & OS_FILE_ON_ERROR_SILENT));
 	ut_a(!(create_mode & OS_FILE_ON_ERROR_NO_EXIT));
@@ -1146,7 +1135,6 @@ os_file_create_directory(
 {
 	int	rcode;
 
-	WAIT_ALLOW_WRITES();
 	rcode = mkdir(pathname, 0770);
 
 	if (!(rcode == 0 || (errno == EEXIST && !fail_if_exists))) {
@@ -1291,13 +1279,13 @@ os_file_create_func(
 
 #if (defined(UNIV_SOLARIS) && defined(DIRECTIO_ON)) || defined O_DIRECT
 	if (type == OS_DATA_FILE) {
+# ifdef __linux__
+use_o_direct:
+# endif
 		switch (srv_file_flush_method) {
 		case SRV_O_DSYNC:
 		case SRV_O_DIRECT:
 		case SRV_O_DIRECT_NO_FSYNC:
-# ifdef __linux__
-use_o_direct:
-# endif
 			os_file_set_nocache(file, name, mode_str);
 			break;
 		default:
@@ -1310,7 +1298,11 @@ use_o_direct:
 		char b[20 + sizeof "/sys/dev/block/" ":"
 		       "/../queue/physical_block_size"];
 		int f;
-		if (fstat(file, &st) || st.st_size & 4095) {
+		if (fstat(file, &st)) {
+			goto skip_o_direct;
+		}
+		MSAN_STAT_WORKAROUND(&st);
+		if (st.st_size & 4095) {
 			goto skip_o_direct;
 		}
 		if (snprintf(b, sizeof b,
@@ -1346,9 +1338,7 @@ use_o_direct:
 				goto skip_o_direct;
 			}
 			log_sys.set_block_size(uint32_t(s));
-			if (srv_file_flush_method == SRV_O_DSYNC) {
-				goto use_o_direct;
-			}
+			goto use_o_direct;
 		} else {
 skip_o_direct:
 			log_sys.set_block_size(0);
@@ -1410,10 +1400,6 @@ os_file_create_simple_no_error_handling_func(
 {
 	os_file_t	file;
 	int		create_flag;
-
-	if (create_mode != OS_FILE_OPEN && create_mode != OS_FILE_OPEN_RAW) {
-		WAIT_ALLOW_WRITES();
-	}
 
 	ut_a(!(create_mode & OS_FILE_ON_ERROR_SILENT));
 	ut_a(!(create_mode & OS_FILE_ON_ERROR_NO_EXIT));
@@ -1489,7 +1475,6 @@ os_file_delete_if_exists_func(
 	}
 
 	int	ret;
-	WAIT_ALLOW_WRITES();
 
 	ret = unlink(name);
 
@@ -1514,7 +1499,6 @@ os_file_delete_func(
 	const char*	name)
 {
 	int	ret;
-	WAIT_ALLOW_WRITES();
 
 	ret = unlink(name);
 
@@ -1553,7 +1537,6 @@ os_file_rename_func(
 #endif /* UNIV_DEBUG */
 
 	int	ret;
-	WAIT_ALLOW_WRITES();
 
 	ret = rename(oldpath, newpath);
 
@@ -1589,8 +1572,10 @@ bool os_file_close_func(os_file_t file)
 os_offset_t
 os_file_get_size(os_file_t file)
 {
-	struct stat statbuf;
-	return fstat(file, &statbuf) ? os_offset_t(-1) : statbuf.st_size;
+  struct stat statbuf;
+  if (fstat(file, &statbuf)) return os_offset_t(-1);
+  MSAN_STAT_WORKAROUND(&statbuf);
+  return statbuf.st_size;
 }
 
 /** Gets a file size.
@@ -1607,6 +1592,7 @@ os_file_get_size(
 	int	ret = stat(filename, &s);
 
 	if (ret == 0) {
+		MSAN_STAT_WORKAROUND(&s);
 		file_size.m_total_size = s.st_size;
 		/* st_blocks is in 512 byte sized blocks */
 		file_size.m_alloc_size = s.st_blocks * 512;
@@ -1650,6 +1636,8 @@ os_file_get_status_posix(
 
 		return(DB_FAIL);
 	}
+
+	MSAN_STAT_WORKAROUND(statinfo);
 
 	switch (statinfo->st_mode & S_IFMT) {
 	case S_IFDIR:
@@ -1723,7 +1711,6 @@ bool
 os_file_set_eof(
 	FILE*		file)	/*!< in: file to be truncated */
 {
-	WAIT_ALLOW_WRITES();
 	return(!ftruncate(fileno(file), ftell(file)));
 }
 
@@ -2168,10 +2155,6 @@ os_file_create_func(
 		? FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
 		: FILE_SHARE_READ | FILE_SHARE_DELETE;
 
-	if (create_mode != OS_FILE_OPEN && create_mode != OS_FILE_OPEN_RAW) {
-		WAIT_ALLOW_WRITES();
-	}
-
 	on_error_no_exit = create_mode & OS_FILE_ON_ERROR_NO_EXIT
 		? true : false;
 
@@ -2424,16 +2407,15 @@ os_file_delete_if_exists_func(
 			return(true);
 		}
 
-		DWORD	lasterr = GetLastError();
-
-		if (lasterr == ERROR_FILE_NOT_FOUND
-		    || lasterr == ERROR_PATH_NOT_FOUND) {
-
+		switch (GetLastError()) {
+		case ERROR_FILE_NOT_FOUND:
+		case ERROR_PATH_NOT_FOUND:
 			/* the file does not exist, this not an error */
 			if (exist != NULL) {
 				*exist = false;
 			}
-
+			/* fall through */
+		case ERROR_ACCESS_DENIED:
 			return(true);
 		}
 
@@ -2682,48 +2664,6 @@ os_file_get_status_win32(
 				CloseHandle(fh);
 			}
 		}
-		stat_info->block_size = 0;
-
-		/* What follows, is calculation of FS block size, which is not important
-		(it is just shown in I_S innodb tables). The error to calculate it will be ignored.*/
-		char	volname[MAX_PATH];
-		BOOL	result = GetVolumePathName(path, volname, MAX_PATH);
-		static	bool warned_once = false;
-		if (!result) {
-			if (!warned_once) {
-				ib::warn()
-					<< "os_file_get_status_win32: "
-					<< "Failed to get the volume path name for: "
-					<< path
-					<< "- OS error number " << GetLastError();
-				warned_once = true;
-			}
-			return(DB_SUCCESS);
-		}
-
-		DWORD	sectorsPerCluster;
-		DWORD	bytesPerSector;
-		DWORD	numberOfFreeClusters;
-		DWORD	totalNumberOfClusters;
-
-		result = GetDiskFreeSpace(
-			(LPCSTR) volname,
-			&sectorsPerCluster,
-			&bytesPerSector,
-			&numberOfFreeClusters,
-			&totalNumberOfClusters);
-
-		if (!result) {
-			if (!warned_once) {
-				ib::warn()
-					<< "GetDiskFreeSpace(" << volname << ",...) "
-					<< "failed "
-					<< "- OS error number " << GetLastError();
-				warned_once = true;
-			}
-			return(DB_SUCCESS);
-		}
-		stat_info->block_size = bytesPerSector * sectorsPerCluster;
 	} else {
 		stat_info->type = OS_FILE_TYPE_UNKNOWN;
 	}
@@ -2807,7 +2747,7 @@ os_file_set_eof(
 
 #endif /* !_WIN32*/
 
-/** Does a syncronous read or write depending upon the type specified
+/** Does a synchronous read or write depending upon the type specified
 In case of partial reads/writes the function tries
 NUM_RETRIES_ON_PARTIAL_IO times to read/write the complete data.
 @param[in]	type,		IO flags
@@ -2937,8 +2877,6 @@ os_file_write_func(
 	dberr_t		err;
 
 	ut_ad(n > 0);
-
-	WAIT_ALLOW_WRITES();
 
 	ssize_t	n_bytes = os_file_pwrite(type, file, (byte*)buf, n, offset, &err);
 
@@ -3293,6 +3231,7 @@ fallback:
 		if (fstat(file, &statbuf)) {
 			err = errno;
 		} else {
+			MSAN_STAT_WORKAROUND(&statbuf);
 			os_offset_t current_size = statbuf.st_size;
 			if (current_size >= size) {
 				return true;
@@ -3522,6 +3461,35 @@ dberr_t IORequest::punch_hole(os_offset_t off, ulint len) const
 	default:
 		return err;
 	}
+}
+
+/*
+  Get file system block size, by path.
+
+  This is expensive on Windows, and not very useful in general,
+  (only shown in some I_S table), so we keep that out of usual
+  stat.
+*/
+size_t os_file_get_fs_block_size(const char *path)
+{
+#ifdef _WIN32
+  char volname[MAX_PATH];
+  if (!GetVolumePathName(path, volname, MAX_PATH))
+    return 0;
+  DWORD sectorsPerCluster;
+  DWORD bytesPerSector;
+  DWORD numberOfFreeClusters;
+  DWORD totalNumberOfClusters;
+
+  if (GetDiskFreeSpace(volname, &sectorsPerCluster, &bytesPerSector,
+                       &numberOfFreeClusters, &totalNumberOfClusters))
+    return ((size_t) bytesPerSector) * sectorsPerCluster;
+#else
+  os_file_stat_t info;
+  if (os_file_get_status(path, &info, false, false) == DB_SUCCESS)
+    return info.block_size;
+#endif
+  return 0;
 }
 
 /** This function returns information about the specified file
@@ -3989,7 +3957,7 @@ static bool is_drive_on_ssd(DWORD nr)
                       sizeof storage_query, &seek_penalty, sizeof seek_penalty,
                       &bytes_written, nullptr))
   {
-    on_ssd= seek_penalty.IncursSeekPenalty;
+    on_ssd= !seek_penalty.IncursSeekPenalty;
   }
   else
   {
@@ -4141,7 +4109,10 @@ void fil_node_t::find_metadata(os_file_t file
 #else
   struct stat sbuf;
   if (!statbuf && !fstat(file, &sbuf))
+  {
+    MSAN_STAT_WORKAROUND(&sbuf);
     statbuf= &sbuf;
+  }
   if (statbuf)
     block_size= statbuf->st_blksize;
 # ifdef UNIV_LINUX
@@ -4174,6 +4145,7 @@ bool fil_node_t::read_page0()
   struct stat statbuf;
   if (fstat(handle, &statbuf))
     return false;
+  MSAN_STAT_WORKAROUND(&statbuf);
   os_offset_t size_bytes= statbuf.st_size;
 #else
   os_offset_t size_bytes= os_file_get_size(handle);

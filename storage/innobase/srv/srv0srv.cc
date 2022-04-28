@@ -472,7 +472,7 @@ priority of the background thread so that it will be scheduled and it
 can release the resource.  This solution is called priority inheritance
 in real-time programming.  A drawback of this solution is that the overhead
 of acquiring a mutex increases slightly, maybe 0.2 microseconds on a 100
-MHz Pentium, because the thread has to call os_thread_get_curr_id.  This may
+MHz Pentium, because the thread has to call pthread_self.  This may
 be compared to 0.5 microsecond overhead for a mutex lock-unlock pair. Note
 that the thread cannot store the information in the resource , say mutex,
 itself, because competing threads could wipe out the information if it is
@@ -655,7 +655,6 @@ static void srv_init()
 
 	/* Initialize some INFORMATION SCHEMA internal structures */
 	trx_i_s_cache_init(trx_i_s_cache);
-
 }
 
 /*********************************************************************//**
@@ -710,8 +709,6 @@ static void srv_refresh_innodb_monitor_stats(time_t current_time)
 	btr_cur_n_sea_old = btr_cur_n_sea;
 	btr_cur_n_non_sea_old = btr_cur_n_non_sea;
 #endif /* BTR_CUR_HASH_ADAPT */
-
-	log_refresh_stats();
 
 	buf_refresh_io_stats();
 

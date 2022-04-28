@@ -55,7 +55,7 @@ Created 10/10/1995 Heikki Tuuri
 /** Simple non-atomic counter
 @tparam	Type  the integer type of the counter */
 template <typename Type>
-struct MY_ALIGNED(CPU_LEVEL1_DCACHE_LINESIZE) simple_counter
+struct alignas(CPU_LEVEL1_DCACHE_LINESIZE) simple_counter
 {
   /** Increment the counter */
   Type inc() { return add(1); }
@@ -275,13 +275,6 @@ extern ulong	srv_flush_log_at_trx_commit;
 extern uint	srv_flush_log_at_timeout;
 extern my_bool	srv_adaptive_flushing;
 extern my_bool	srv_flush_sync;
-
-#ifdef WITH_INNODB_DISALLOW_WRITES
-extern my_bool innodb_disallow_writes;
-void innodb_wait_allow_writes();
-#else
-# define innodb_wait_allow_writes() do {} while (0)
-#endif /* WITH_INNODB_DISALLOW_WRITES */
 
 /** Requested size in bytes */
 extern ulint		srv_buf_pool_size;

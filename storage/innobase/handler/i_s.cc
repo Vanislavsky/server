@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 2007, 2016, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2014, 2021, MariaDB Corporation.
+Copyright (c) 2014, 2022, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -4808,12 +4808,13 @@ i_s_dict_fill_sys_tables(
 
 /** Convert one SYS_TABLES record to dict_table_t.
 @param pcur      persistent cursor position on SYS_TABLES record
+@param mtr       mini-transaction (nullptr=use the dict_sys cache)
 @param rec       record to read from (nullptr=use the dict_sys cache)
 @param table     the converted dict_table_t
 @return error message
 @retval nullptr on success */
-static const char *i_s_sys_tables_rec(const btr_pcur_t &pcur, const rec_t *rec,
-                                      dict_table_t **table)
+static const char *i_s_sys_tables_rec(const btr_pcur_t &pcur, mtr_t *mtr,
+                                      const rec_t *rec, dict_table_t **table)
 {
   static_assert(DICT_FLD__SYS_TABLES__NAME == 0, "compatibility");
   size_t len;
@@ -4831,12 +4832,11 @@ static const char *i_s_sys_tables_rec(const btr_pcur_t &pcur, const rec_t *rec,
       return "corrupted SYS_TABLES.NAME";
   }
 
-  const span<const char>name{reinterpret_cast<const char*>(pcur.old_rec), len};
-
   if (rec)
-    return dict_load_table_low(name, rec, table);
+    return dict_load_table_low(mtr, rec, table);
 
-  *table= dict_sys.load_table(name);
+  *table= dict_sys.load_table
+    (span<const char>{reinterpret_cast<const char*>(pcur.old_rec), len});
   return *table ? nullptr : "Table not found in cache";
 }
 
@@ -4878,7 +4878,7 @@ i_s_sys_tables_fill_table(
 
 		/* Create and populate a dict_table_t structure with
 		information from SYS_TABLES row */
-		err_msg = i_s_sys_tables_rec(pcur, rec, &table_rec);
+		err_msg = i_s_sys_tables_rec(pcur, &mtr, rec, &table_rec);
 		mtr.commit();
 		dict_sys.unlock();
 
@@ -5116,7 +5116,8 @@ i_s_sys_tables_fill_table_stats(
 		mtr.commit();
 		/* Fetch the dict_table_t structure corresponding to
 		this SYS_TABLES record */
-		err_msg = i_s_sys_tables_rec(pcur, nullptr, &table_rec);
+		err_msg = i_s_sys_tables_rec(pcur, nullptr, nullptr,
+                                             &table_rec);
 
 		if (UNIV_LIKELY(!err_msg)) {
 			bool evictable = dict_sys.prevent_eviction(table_rec);
@@ -6483,6 +6484,8 @@ static ST_FIELD_INFO innodb_sys_tablespaces_fields_info[]=
 };
 } // namespace Show
 
+extern size_t os_file_get_fs_block_size(const char *path);
+
 /** Produce one row of INFORMATION_SCHEMA.INNODB_SYS_TABLESPACES.
 @param thd  connection
 @param s    tablespace
@@ -6524,31 +6527,18 @@ static int i_s_sys_tablespaces_fill(THD *thd, const fil_space_t &s, TABLE *t)
   OK(field_store_string(fields[SYS_TABLESPACES_FILENAME], filepath));
 
   OK(fields[SYS_TABLESPACES_PAGE_SIZE]->store(s.physical_size(), true));
-  os_file_stat_t stat;
-  stat.block_size= 0;
+  size_t fs_block_size;
   os_file_size_t file= os_file_get_size(filepath);
   if (file.m_total_size == os_offset_t(~0))
   {
     file.m_total_size= 0;
     file.m_alloc_size= 0;
+    fs_block_size= 0;
   }
   else
-  {
-    /* Get the file system (or Volume) block size. */
-    switch (dberr_t err= os_file_get_status(filepath, &stat, false, false)) {
-    case DB_FAIL:
-      ib::warn() << "File '" << filepath << "', failed to get stats";
-      break;
-    case DB_SUCCESS:
-    case DB_NOT_FOUND:
-      break;
-    default:
-      ib::error() << "File '" << filepath << "' " << err;
-      break;
-    }
-  }
+    fs_block_size= os_file_get_fs_block_size(filepath);
 
-  OK(fields[SYS_TABLESPACES_FS_BLOCK_SIZE]->store(stat.block_size, true));
+  OK(fields[SYS_TABLESPACES_FS_BLOCK_SIZE]->store(fs_block_size, true));
   OK(fields[SYS_TABLESPACES_FILE_SIZE]->store(file.m_total_size, true));
   OK(fields[SYS_TABLESPACES_ALLOC_SIZE]->store(file.m_alloc_size, true));
 

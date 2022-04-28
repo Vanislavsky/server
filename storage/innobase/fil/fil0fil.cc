@@ -83,7 +83,9 @@ bool fil_space_t::try_to_close(bool print_info)
     of fil_system.space_list, so that they would be less likely to be
     closed here. */
     fil_node_t *node= UT_LIST_GET_FIRST(space.chain);
-    ut_ad(node);
+    if (!node)
+      /* fil_ibd_create() did not invoke fil_space_t::add() yet */
+      continue;
     ut_ad(!UT_LIST_GET_NEXT(chain, node));
 
     if (!node->is_open())
@@ -444,6 +446,8 @@ static bool fil_node_open_file(fil_node_t *node)
       /* Flush tablespaces so that we can close modified files. */
       fil_flush_file_spaces();
       mysql_mutex_lock(&fil_system.mutex);
+      if (node->is_open())
+        return true;
     }
   }
 
@@ -890,8 +894,9 @@ bool fil_space_free(uint32_t id, bool x_latched)
 
 			log_sys.latch.wr_unlock();
 		} else {
+#ifndef SUX_LOCK_GENERIC
 			ut_ad(log_sys.latch.is_write_locked());
-
+#endif
 			if (space->max_lsn) {
 				ut_d(space->max_lsn = 0);
 				fil_system.named_spaces.remove(*space);
@@ -984,6 +989,9 @@ fil_space_t *fil_space_t::create(uint32_t id, uint32_t flags,
 	default:
 		ut_ad(purpose != FIL_TYPE_TEMPORARY);
 		if (UNIV_LIKELY(id <= fil_system.max_assigned_id)) {
+			break;
+		}
+		if (UNIV_UNLIKELY(srv_operation == SRV_OPERATION_BACKUP)) {
 			break;
 		}
 		if (!fil_system.space_id_reuse_warned) {
@@ -1131,7 +1139,10 @@ err_exit:
     }
 
     if (create_new_db)
+    {
+      node->find_metadata(node->handle);
       continue;
+    }
     if (skip_read)
     {
       size+= node->size;
@@ -1480,6 +1491,7 @@ static void fil_name_commit_durable(mtr_t *mtr)
   log_sys.latch.wr_lock(SRW_LOCK_CALL);
   auto lsn= mtr->commit_files();
   log_sys.latch.wr_unlock();
+  mtr->flag_wr_unlock();
   log_write_up_to(lsn, true);
 }
 
@@ -1712,8 +1724,9 @@ char* fil_make_filepath(const char *path, const fil_space_t::name_type &name,
 	if (path != NULL) {
 		memcpy(full_name, path, path_len);
 		len = path_len;
-		full_name[len] = '\0';
 	}
+
+	full_name[len] = '\0';
 
 	if (trim_name) {
 		/* Find the offset of the last DIR separator and set it to
@@ -1860,8 +1873,10 @@ static bool fil_rename_tablespace(uint32_t id, const char *old_path,
 	}
 
 	/* log_sys.latch is above fil_system.mutex in the latching order */
+#ifndef SUX_LOCK_GENERIC
 	ut_ad(log_sys.latch.is_write_locked() ||
 	      srv_operation == SRV_OPERATION_RESTORE_DELTA);
+#endif
 	mysql_mutex_lock(&fil_system.mutex);
 	space->release();
 	ut_ad(node->name == old_file_name);
@@ -2070,7 +2085,7 @@ a remote tablespace is found it will be changed to true.
 If the fix_dict boolean is set, then it is safe to use an internal SQL
 statement to update the dictionary tables if they are incorrect.
 
-@param[in]	validate	true if we should validate the tablespace
+@param[in]	validate	0=maybe missing, 1=do not validate, 2=validate
 @param[in]	purpose		FIL_TYPE_TABLESPACE or FIL_TYPE_TEMPORARY
 @param[in]	id		tablespace ID
 @param[in]	flags		expected FSP_SPACE_FLAGS
@@ -2082,7 +2097,7 @@ If file-per-table, it is the table name in the databasename/tablename format
 @retval	NULL	if the tablespace could not be opened */
 fil_space_t*
 fil_ibd_open(
-	bool			validate,
+	unsigned		validate,
 	fil_type_t		purpose,
 	uint32_t		id,
 	uint32_t		flags,
@@ -2094,7 +2109,7 @@ fil_ibd_open(
 	fil_space_t* space = fil_space_get_by_id(id);
 	mysql_mutex_unlock(&fil_system.mutex);
 	if (space) {
-		if (validate && !srv_read_only_mode) {
+		if (validate > 1 && !srv_read_only_mode) {
 			fsp_flags_try_adjust(space,
 					     flags & ~FSP_FLAGS_MEM_MASK);
 		}
@@ -2131,8 +2146,9 @@ func_exit:
 
 	/* Look for a filepath embedded in an ISL where the default file
 	would be. */
-	if (df_remote.open_link_file(name)) {
-		validate = true;
+	bool must_validate = df_remote.open_link_file(name);
+
+	if (must_validate) {
 		if (df_remote.open_read_only(true) == DB_SUCCESS) {
 			ut_ad(df_remote.is_open());
 			++tablespaces_found;
@@ -2145,15 +2161,12 @@ func_exit:
 				    << df_remote.filepath()
 				    << "' could not be opened read-only.";
 		}
-	}
-
-	/* Attempt to open the tablespace at the dictionary filepath. */
-	if (path_in) {
-		if (!df_default.same_filepath_as(path_in)) {
-			/* Dict path is not the default path. Always validate
-			remote files. If default is opened, it was moved. */
-			validate = true;
-		}
+	} else if (path_in && !df_default.same_filepath_as(path_in)) {
+		/* Dict path is not the default path. Always validate
+		remote files. If default is opened, it was moved. */
+		must_validate = true;
+	} else if (validate > 1) {
+		must_validate = true;
 	}
 
 	/* Always look for a file at the default location. But don't log
@@ -2165,7 +2178,7 @@ func_exit:
 	the first server startup. The tables ought to be dropped by
 	drop_garbage_tables_after_restore() a little later. */
 
-	const bool strict = !tablespaces_found
+	const bool strict = validate && !tablespaces_found
 		&& !(srv_operation == SRV_OPERATION_NORMAL
 		     && srv_start_after_restore
 		     && srv_force_recovery < SRV_FORCE_NO_BACKGROUND
@@ -2191,7 +2204,7 @@ func_exit:
 	normal, we only found 1. */
 	/* For encrypted tablespace, we need to check the
 	encryption in header of first page. */
-	if (!validate && tablespaces_found == 1) {
+	if (!must_validate && tablespaces_found == 1) {
 		goto skip_validate;
 	}
 
@@ -2207,7 +2220,8 @@ func_exit:
 	First, bail out if no tablespace files were found. */
 	if (valid_tablespaces_found == 0) {
 		if (!strict
-		    && IF_WIN(GetLastError() == ERROR_FILE_NOT_FOUND,
+		    && IF_WIN(GetLastError() == ERROR_FILE_NOT_FOUND
+			      || GetLastError() == ERROR_PATH_NOT_FOUND,
 			      errno == ENOENT)) {
 			/* Suppress a message about a missing file. */
 			goto corrupted;
@@ -2220,7 +2234,7 @@ func_exit:
 				TROUBLESHOOT_DATADICT_MSG);
 		goto corrupted;
 	}
-	if (!validate) {
+	if (!must_validate) {
 		goto skip_validate;
 	}
 
@@ -2303,7 +2317,7 @@ skip_validate:
 		df_remote.is_open() ? df_remote.filepath() :
 		df_default.filepath(), OS_FILE_CLOSED, 0, false, true);
 
-	if (validate && !srv_read_only_mode) {
+	if (must_validate && !srv_read_only_mode) {
 		df_remote.close();
 		df_default.close();
 		if (space->acquire()) {
@@ -2579,6 +2593,13 @@ tablespace_check:
 		? fil_space_read_crypt_data(fil_space_t::zip_size(flags),
 					    first_page)
 		: NULL;
+
+	if (crypt_data && !crypt_data->is_key_found()) {
+		crypt_data->~fil_space_crypt_t();
+		ut_free(crypt_data);
+		return FIL_LOAD_INVALID;
+	}
+
 	space = fil_space_t::create(
 		space_id, flags, FIL_TYPE_TABLESPACE, crypt_data);
 
@@ -3035,7 +3056,9 @@ void
 fil_names_dirty(
 	fil_space_t*	space)
 {
+#ifndef SUX_LOCK_GENERIC
 	ut_ad(log_sys.latch.is_write_locked());
+#endif
 	ut_ad(recv_recovery_is_on());
 	ut_ad(log_sys.get_lsn() != 0);
 	ut_ad(space->max_lsn == 0);
@@ -3049,7 +3072,9 @@ fil_names_dirty(
 tablespace was modified for the first time since fil_names_clear(). */
 ATTRIBUTE_NOINLINE ATTRIBUTE_COLD void mtr_t::name_write()
 {
+#ifndef SUX_LOCK_GENERIC
   ut_ad(log_sys.latch.is_write_locked());
+#endif
   ut_d(fil_space_validate_for_mtr_commit(m_user_space));
   ut_ad(!m_user_space->max_lsn);
   m_user_space->max_lsn= log_sys.get_lsn();
@@ -3062,10 +3087,6 @@ ATTRIBUTE_NOINLINE ATTRIBUTE_COLD void mtr_t::name_write()
   fil_name_write(m_user_space->id,
                  UT_LIST_GET_FIRST(m_user_space->chain)->name,
                  &mtr);
-
-  DBUG_EXECUTE_IF("fil_names_write_bogus",
-                  {fil_name_write(SRV_SPACE_ID_UPPER_BOUND,
-                                  "./test/bogus file.ibd", &mtr);});
   mtr.commit_files();
 }
 
@@ -3077,7 +3098,9 @@ lsn_t fil_names_clear(lsn_t lsn)
 {
 	mtr_t	mtr;
 
+#ifndef SUX_LOCK_GENERIC
 	ut_ad(log_sys.latch.is_write_locked());
+#endif
 	ut_ad(lsn);
 	ut_ad(log_sys.is_latest());
 

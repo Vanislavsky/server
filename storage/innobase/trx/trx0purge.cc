@@ -29,7 +29,6 @@ Created 3/26/1996 Heikki Tuuri
 #include "fut0fut.h"
 #include "mach0data.h"
 #include "mtr0log.h"
-#include "os0thread.h"
 #include "que0que.h"
 #include "row0purge.h"
 #include "row0upd.h"
@@ -119,9 +118,9 @@ TRANSACTIONAL_INLINE inline bool TrxUndoRsegsIterator::set_next()
 	trx_id_t last_trx_no, tail_trx_no;
 	{
 #ifdef SUX_LOCK_GENERIC
-		purge_sys.rseg->latch.rd_lock();
+		purge_sys.rseg->latch.rd_lock(SRW_LOCK_CALL);
 #else
-		transactional_shared_lock_guard<srw_spin_lock_low> rg
+		transactional_shared_lock_guard<srw_spin_lock> rg
 			{purge_sys.rseg->latch};
 #endif
 		last_trx_no = purge_sys.rseg->last_trx_no();
@@ -367,7 +366,7 @@ static void trx_purge_free_segment(trx_rseg_t *rseg, fil_addr_t hdr_addr)
 	/* We only need the latch to maintain rseg->curr_size. To follow the
 	latching order, we must acquire it before acquiring any related
 	page latch.  */
-	rseg->latch.wr_lock();
+	rseg->latch.wr_lock(SRW_LOCK_CALL);
 
 	buf_block_t* rseg_hdr = trx_rsegf_get(rseg->space, rseg->page_no, &mtr);
 	buf_block_t* block = trx_undo_page_get(hdr_page_id, &mtr);
@@ -387,7 +386,7 @@ static void trx_purge_free_segment(trx_rseg_t *rseg, fil_addr_t hdr_addr)
 		rseg->latch.wr_unlock();
 		mtr.commit();
 		mtr.start();
-		rseg->latch.wr_lock();
+		rseg->latch.wr_lock(SRW_LOCK_CALL);
 
 		rseg_hdr = trx_rsegf_get(rseg->space, rseg->page_no, &mtr);
 
@@ -449,7 +448,7 @@ trx_purge_truncate_rseg_history(
 
 	mtr.start();
 	ut_ad(rseg.is_persistent());
-	rseg.latch.wr_lock();
+	rseg.latch.wr_lock(SRW_LOCK_CALL);
 
 	buf_block_t* rseg_hdr = trx_rsegf_get(rseg.space, rseg.page_no, &mtr);
 
@@ -511,7 +510,7 @@ func_exit:
 	}
 
 	mtr.start();
-	rseg.latch.wr_lock();
+	rseg.latch.wr_lock(SRW_LOCK_CALL);
 
 	rseg_hdr = trx_rsegf_get(rseg.space, rseg.page_no, &mtr);
 
@@ -636,9 +635,9 @@ TRANSACTIONAL_TARGET static void trx_purge_truncate_history()
       if (rseg.space != &space)
         continue;
 #ifdef SUX_LOCK_GENERIC
-      rseg.latch.rd_lock();
+      rseg.latch.rd_lock(SRW_LOCK_CALL);
 #else
-      transactional_shared_lock_guard<srw_spin_lock_low> g{rseg.latch};
+      transactional_shared_lock_guard<srw_spin_lock> g{rseg.latch};
 #endif
       ut_ad(rseg.skip_allocation());
       if (rseg.is_referenced())
@@ -849,7 +848,7 @@ static void trx_purge_rseg_get_next_history_log(
 
 	mtr.start();
 
-	purge_sys.rseg->latch.wr_lock();
+	purge_sys.rseg->latch.wr_lock(SRW_LOCK_CALL);
 
 	ut_a(purge_sys.rseg->last_page_no != FIL_NULL);
 
@@ -901,7 +900,7 @@ static void trx_purge_rseg_get_next_history_log(
 
 	mtr.commit();
 
-	purge_sys.rseg->latch.wr_lock();
+	purge_sys.rseg->latch.wr_lock(SRW_LOCK_CALL);
 
 	purge_sys.rseg->last_page_no = prev_log_addr.page;
 	purge_sys.rseg->set_last_commit(prev_log_addr.boffset, trx_no);
@@ -1090,7 +1089,7 @@ trx_purge_fetch_next_rec(
 	}
 
 	/* fprintf(stderr, "Thread %lu purging trx %llu undo record %llu\n",
-	os_thread_get_curr_id(), iter->trx_no, iter->undo_no); */
+	pthread_self(), iter->trx_no, iter->undo_no); */
 
 	*roll_ptr = trx_undo_build_roll_ptr(
 		/* row_purge_record_func() will later set
